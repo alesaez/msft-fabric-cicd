@@ -36,7 +36,7 @@ else:
     print("Running from Local - Using Current User Credentials")
     token_credential = DefaultAzureCredential() 
     workspace_id = input("Enter your Workspace ID: ") # Fabric Workspace ID
-    item_type_in_scope = ["Notebook"]
+    item_type_in_scope = ["Notebook", "Environment", "DataPipeline"]
 
 # Initialize the FabricWorkspace object with the required parameters
 target_workspace = FabricWorkspace(
