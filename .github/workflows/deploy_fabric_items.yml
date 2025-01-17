@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
           workspaceId:
-            description: 'Fabric Workspace'
+            description: 'Fabric Workspace ID'
             required: true
             type: string
 

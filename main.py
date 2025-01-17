@@ -2,18 +2,17 @@
 """
 Example of authenticating with SPN + Secret
 Can be expanded to retrieve values from Key Vault or other sources
-If using Current User Credentials, ensure you have logged in using 'az login --use-device-code --allow-no-subscriptions' and have the required permissions to the Fabric Workspace
+If using Current User Credentials, ensure you have logged in using 'az login' or 'az login --use-device-code --allow-no-subscriptions' and have the required permissions to the Fabric Workspace
 
 Pre-requisites:
 pip install -r requirements.txt
-pip install fabric-cicd
 
 """
 
 import os
 
 # Setting parameters
-environment = ""
+environment = "" 
 repository_directory = os.path.join(os.path.dirname(__file__), "workspace") # Path to the workspace directory
 
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
@@ -39,10 +38,6 @@ else:
     workspace_id = input("Enter your Workspace ID: ") # Fabric Workspace ID
     item_type_in_scope = ["Notebook"]
 
-
-print (f"Using Workspace ID: {workspace_id}")
-print (f"Using Repository Directory: {repository_directory}")
-print (f"Using Item Types: {item_type_in_scope}")
 # Initialize the FabricWorkspace object with the required parameters
 target_workspace = FabricWorkspace(
     workspace_id=workspace_id,
