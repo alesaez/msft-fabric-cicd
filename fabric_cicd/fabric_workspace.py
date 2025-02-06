@@ -1,16 +1,21 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 """Module provides the FabricWorkspace class to manage and publish workspace items to the Fabric API."""
 
 import base64
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
+import dpath
 import yaml
 from azure.core.credentials import TokenCredential
 from azure.identity import DefaultAzureCredential
 
-from fabric_cicd._common._exceptions import ParsingError
+from fabric_cicd._common._exceptions import ItemDependencyError, ParsingError
 from fabric_cicd._common._fabric_endpoint import FabricEndpoint
 
 logger = logging.getLogger(__name__)
@@ -18,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 class FabricWorkspace:
     """A class to manage and publish workspace items to the Fabric API."""
+
+    ACCEPTED_ITEM_TYPES_UPN = ("DataPipeline", "Environment", "Notebook", "Report", "SemanticModel")
+    ACCEPTED_ITEM_TYPES_NON_UPN = ("Environment", "Notebook", "Report", "SemanticModel")
 
     def __init__(
         self,
@@ -31,50 +39,56 @@ class FabricWorkspace:
         """
         Initializes the FabricWorkspace instance.
 
-        :param workspace_id: The ID of the workspace to interact with.
-        :type workspace_id: str
-        :param repository_directory: Directory path where repository items are located.
-        :type repository_directory: str
-        :param item_type_in_scope: Item types that should be deployed for given workspace.
-        :type item_type_in_scope: list
-        :param base_api_url: Base URL for the Fabric API. Defaults to the Fabric API endpoint.
-        :type base_api_url: str, optional
-        :param environment: The environment to be used for parameterization.
-        :type environment: str, optional
-        :param token_credential: The token credential to use for API requests.
-        :type token_credential: str, optional
+        Parameters
+        ----------
+        workspace_id : str
+            The ID of the workspace to interact with.
+        repository_directory : str
+            Local directory path of the repository where items are to be deployed from.
+        item_type_in_scope : list
+            Item types that should be deployed for given workspace.
+        base_api_url : str, optional
+            Base URL for the Fabric API. Defaults to the Fabric API endpoint.
+        environment : str, optional
+            The environment to be used for parameterization.
+        token_credential : str, optional
+            The token credential to use for API requests.
 
-        Examples:
-            Basic usage:
-                >>> workspace = FabricWorkspace(
-                ...     workspace_id="your-workspace-id",
-                ...     repository_directory="/path/to/repo",
-                ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"]
-                ... )
+        Examples
+        --------
+        Basic usage
+        >>> from fabric_cicd import FabricWorkspace
+        >>> workspace = FabricWorkspace(
+        ...     workspace_id="your-workspace-id",
+        ...     repository_directory="/path/to/repo",
+        ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"]
+        ... )
 
-            With optional parameters:
-                >>> workspace = FabricWorkspace(
-                ...     workspace_id="your-workspace-id",
-                ...     repository_directory="/your/path/to/repo",
-                ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"],
-                ...     base_api_url="https://orgapi.fabric.microsoft.com",
-                ...     environment="your-target-environment"
-                ... )
+        With optional parameters
+        >>> from fabric_cicd import FabricWorkspace
+        >>> workspace = FabricWorkspace(
+        ...     workspace_id="your-workspace-id",
+        ...     repository_directory="/your/path/to/repo",
+        ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"],
+        ...     base_api_url="https://orgapi.fabric.microsoft.com",
+        ...     environment="your-target-environment"
+        ... )
 
-            With token credential:
-                >>> from azure.identity import ClientSecretCredential
-                >>> client_id = "your-client-id"
-                >>> client_secret = "your-client-secret"
-                >>> tenant_id = "your-tenant-id"
-                >>> token_credential = ClientSecretCredential(
-                ...     client_id=client_id, client_secret=client_secret, tenant_id=tenant_id
-                ... )
-                >>> workspace = FabricWorkspace(
-                ...     workspace_id="your-workspace-id",
-                ...     repository_directory="/your/path/to/repo",
-                ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"],
-                ...     token_credential=token_credential
-                ... )
+        With token credential
+        >>> from fabric_cicd import FabricWorkspace
+        >>> from azure.identity import ClientSecretCredential
+        >>> client_id = "your-client-id"
+        >>> client_secret = "your-client-secret"
+        >>> tenant_id = "your-tenant-id"
+        >>> token_credential = ClientSecretCredential(
+        ...     client_id=client_id, client_secret=client_secret, tenant_id=tenant_id
+        ... )
+        >>> workspace = FabricWorkspace(
+        ...     workspace_id="your-workspace-id",
+        ...     repository_directory="/your/path/to/repo",
+        ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"],
+        ...     token_credential=token_credential
+        ... )
 
         """
         from fabric_cicd._common._validate_input import (
@@ -120,12 +134,14 @@ class FabricWorkspace:
         """Refreshes the repository_items dictionary by scanning the repository directory."""
         self.repository_items = {}
 
-        for directory in os.scandir(self.repository_directory):
-            if directory.is_dir():
-                item_metadata_path = Path(directory.path, ".platform")
+        for root, _dirs, files in os.walk(self.repository_directory):
+            directory = Path(root)
+            # valid item directory with .platform file within
+            if ".platform" in files:
+                item_metadata_path = Path(directory, ".platform")
 
                 # Print a warning and skip directory if empty
-                if not os.listdir(directory.path):
+                if not os.listdir(directory):
                     logger.warning(f"Directory {directory.name} is empty.")
                     continue
 
@@ -157,7 +173,7 @@ class FabricWorkspace:
                 # Add the item to the repository_items dictionary
                 self.repository_items[item_type][item_name] = {
                     "description": item_description,
-                    "path": directory.path,
+                    "path": str(directory),
                     "guid": item_guid,
                     "logical_id": item_logical_id,
                 }
@@ -217,55 +233,62 @@ class FabricWorkspace:
 
         return raw_file
 
-    def _replace_activity_workspace_ids(self, raw_file, lookup_type):
+    def _replace_workspace_ids(self, raw_file, item_type):
         """
-        Replaces feature branch workspace ID referenced in data pipeline activities with target workspace ID
-        in the raw file content.
+        Replaces feature branch workspace ID, default (i.e. 00000000-0000-0000-0000-000000000000) and non-default
+        (actual workspace ID guid) values, with target workspace ID in the raw file content.
 
         :param raw_file: The raw file content where workspace IDs need to be replaced.
+        :param item_type: Type of item where the replacement occurs (e.g., Notebook, DataPipeline).
         :return: The raw file content with feature branch workspace IDs replaced by target workspace IDs.
         """
-        # Create a dictionary from the raw_file
+        # Replace all instances of default feature branch workspace ID with target workspace ID
+        target_workspace_id = self.workspace_id
+        default_workspace_string = '"workspaceId": "00000000-0000-0000-0000-000000000000"'
+        target_workspace_string = f'"workspaceId": "{target_workspace_id}"'
+
+        if default_workspace_string in raw_file:
+            raw_file = raw_file.replace(default_workspace_string, target_workspace_string)
+
+        # For DataPipeline item, additional replacements may be required
+        if item_type == "DataPipeline":
+            raw_file = self._replace_activity_workspace_ids(raw_file, target_workspace_id)
+
+        return raw_file
+
+    def _replace_activity_workspace_ids(self, raw_file, target_workspace_id):
+        """
+        Replaces all instances of non-default feature branch workspace IDs (actual guid of feature branch workspace)
+        with target workspace ID found in DataPipeline activities.
+        """
+        # Create a dictionary from the raw file
         item_content_dict = json.loads(raw_file)
+        guid_pattern = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
 
-        def _find_and_replace_activity_workspace_ids(input_object):
-            """
-            Recursively scans through JSON to find and replace feature branch workspace IDs in nested and
-            non-nested activities where workspaceId
-            property exists (e.g. Trident Notebook). Note: the function can be modified to process other pipeline
-            activities where workspaceId exists.
+        # Activities mapping dictionary: {Key: activity_name, Value: [item_type, item_id_name]}
+        activities_mapping = {"RefreshDataflow": ["Dataflow", "dataflowId"]}
 
-            :param input_object: Object can be a dictionary or list present in the input JSON.
-            """
-            # Check if the current object is a dictionary
-            if isinstance(input_object, dict):
-                target_workspace_id = self.workspace_id
+        # dpath library finds and replaces feature branch workspace IDs found in all levels of activities in the dictionary
+        for path, activity_value in dpath.search(item_content_dict, "**/type", yielded=True):
+            if activity_value in activities_mapping:
+                # Split the path into components, create a path to 'workspaceId' and get the workspace ID value
+                path = path.split("/")
+                workspace_id_path = (*path[:-1], "typeProperties", "workspaceId")
+                workspace_id = dpath.get(item_content_dict, workspace_id_path)
 
-                # Iterate through the activities and search for TridentNotebook activities
-                for key, value in input_object.items():
-                    if key == "type" and value == "TridentNotebook":
-                        # Convert the notebook ID to its name
-                        item_type = "Notebook"
-                        referenced_id = input_object["typeProperties"]["notebookId"]
-                        referenced_name = self._convert_id_to_name(
-                            item_type=item_type, generic_id=referenced_id, lookup_type=lookup_type
-                        )
-                        # Replace workspace ID with target workspace ID if the referenced notebook exists in the repo
-                        if referenced_name:
-                            input_object["typeProperties"]["workspaceId"] = target_workspace_id
-
-                    # Recursively search in the value
-                    else:
-                        _find_and_replace_activity_workspace_ids(value)
-
-            # Check if the current object is a list
-            elif isinstance(input_object, list):
-                # Recursively search in each item
-                for item in input_object:
-                    _find_and_replace_activity_workspace_ids(item)
-
-        # Start the recursive search and replace from the root of the JSON data
-        _find_and_replace_activity_workspace_ids(item_content_dict)
+                # Check if the workspace ID is a valid GUID and is not the target workspace ID
+                if guid_pattern.match(workspace_id) and workspace_id != target_workspace_id:
+                    item_type, item_id_name = activities_mapping[activity_value]
+                    # Create a path to the item's ID and get the item ID value
+                    item_id_path = (*path[:-1], "typeProperties", item_id_name)
+                    item_id = dpath.get(item_content_dict, item_id_path)
+                    # Convert the item ID to a name to check if it exists in the repository
+                    item_name = self._convert_id_to_name(
+                        item_type=item_type, generic_id=item_id, lookup_type="Repository"
+                    )
+                    # If the item exists, the associated workspace ID is a feature branch workspace ID and will get replaced
+                    if item_name:
+                        dpath.set(item_content_dict, workspace_id_path, target_workspace_id)
 
         # Convert the updated dict back to a JSON string
         return json.dumps(item_content_dict, indent=2)
@@ -287,7 +310,22 @@ class FabricWorkspace:
         # if not found
         return None
 
-    def _publish_item(self, item_name, item_type, excluded_files=None, full_publish=True):
+    def _convert_path_to_id(self, item_type, path):
+        """
+        For a given path and item type, returns the logical id.
+
+        :param item_type: Type of the item (e.g., Notebook, Environment).
+        :param path: Full path of the desired item.
+        """
+        for item_details in self.repository_items[item_type].values():
+            if Path(item_details.get("path")) == Path(path):
+                return item_details["logical_id"]
+        # if not found
+        return None
+
+    def _publish_item(
+        self, item_name, item_type, excluded_files=None, excluded_directories=None, full_publish=True, **kwargs
+    ):
         """
         Publishes or updates an item in the Fabric Workspace.
 
@@ -301,31 +339,58 @@ class FabricWorkspace:
         item_guid = self.repository_items[item_type][item_name]["guid"]
         item_description = self.repository_items[item_type][item_name]["description"]
 
+        max_retries = 10 if item_type == "SemanticModel" else 5
+
         excluded_files = excluded_files or {".platform"}
+        excluded_directories = excluded_directories or None
 
         metadata_body = {"displayName": item_name, "type": item_type, "description": item_description}
 
         if full_publish:
             item_payload = []
-            for root, _, files in os.walk(item_path):
+            for root, dirs, files in os.walk(item_path):
+                # modify dirs in place
+                dirs[:] = [d for d in dirs if d not in excluded_directories]
+
                 for file in files:
                     full_path = Path(root, file)
-                    relative_path = str(full_path.relative_to(item_path))
+                    relative_path = str(full_path.relative_to(item_path).as_posix())
 
                     if file not in excluded_files:
                         with Path.open(full_path, encoding="utf-8") as f:
                             raw_file = f.read()
 
-                        # Replace feature branch workspace IDs with target workspace IDs in data pipeline activities.
-                        if item_type == "DataPipeline":
-                            raw_file = self._replace_activity_workspace_ids(raw_file, "Repository")
+                        # Replace feature branch workspace IDs with target workspace IDs in a data pipeline/notebook file.
+                        if item_type in ["DataPipeline", "Notebook"]:
+                            raw_file = self._replace_workspace_ids(raw_file, item_type)
 
-                        # Replace default workspace id with target workspace id
-                        # TODO Remove this once bug is resolved in API
-                        if item_type == "Notebook":
-                            default_workspace_string = '"workspaceId": "00000000-0000-0000-0000-000000000000"'
-                            target_workspace_string = f'"workspaceId": "{self.workspace_id}"'
-                            raw_file = raw_file.replace(default_workspace_string, target_workspace_string)
+                        # Replace connections in report
+                        if item_type == "Report" and Path(file).name == "definition.pbir":
+                            definition_body = json.loads(raw_file)
+                            if (
+                                "datasetReference" in definition_body
+                                and "byPath" in definition_body["datasetReference"]
+                            ):
+                                model_rel_path = definition_body["datasetReference"]["byPath"]["path"]
+                                model_path = str((Path(item_path) / model_rel_path).resolve())
+                                model_id = self._convert_path_to_id("SemanticModel", model_path)
+
+                                if not model_id:
+                                    msg = "Semantic model not found in the repository. Cannot deploy a report with a relative path without deploying the model."
+                                    raise ItemDependencyError(msg, logger)
+
+                                definition_body["datasetReference"] = {
+                                    "byConnection": {
+                                        "connectionString": None,
+                                        "pbiServiceModelId": None,
+                                        "pbiModelVirtualServerName": "sobe_wowvirtualserver",
+                                        "pbiModelDatabaseName": f"{model_id}",
+                                        "name": "EntityDataSource",
+                                        "connectionType": "pbiServiceXmlaStyleLive",
+                                    }
+                                }
+
+                                raw_file = json.dumps(definition_body, indent=4)
 
                         # Replace logical IDs with deployed GUIDs.
                         replaced_raw_file = self._replace_logical_ids(raw_file)
@@ -347,7 +412,7 @@ class FabricWorkspace:
             # Create a new item if it does not exist
             # https://learn.microsoft.com/en-us/rest/api/fabric/core/items/create-item
             item_create_response = self.endpoint.invoke(
-                method="POST", url=f"{self.base_api_url}/items", body=combined_body
+                method="POST", url=f"{self.base_api_url}/items", body=combined_body, max_retries=max_retries
             )
             item_guid = item_create_response["body"]["id"]
             self.repository_items[item_type][item_name]["guid"] = item_guid
@@ -356,7 +421,10 @@ class FabricWorkspace:
                 # Update the item's definition if full publish is required
                 # https://learn.microsoft.com/en-us/rest/api/fabric/core/items/update-item-definition
                 self.endpoint.invoke(
-                    method="POST", url=f"{self.base_api_url}/items/{item_guid}/updateDefinition", body=definition_body
+                    method="POST",
+                    url=f"{self.base_api_url}/items/{item_guid}/updateDefinition",
+                    body=definition_body,
+                    max_retries=max_retries,
                 )
 
             # Remove the 'type' key as it's not supported in the update-item API
@@ -364,9 +432,16 @@ class FabricWorkspace:
 
             # Update the item's metadata
             # https://learn.microsoft.com/en-us/rest/api/fabric/core/items/update-item
-            self.endpoint.invoke(method="PATCH", url=f"{self.base_api_url}/items/{item_guid}", body=metadata_body)
+            self.endpoint.invoke(
+                method="PATCH",
+                url=f"{self.base_api_url}/items/{item_guid}",
+                body=metadata_body,
+                max_retries=max_retries,
+            )
 
-        logger.info("Published")
+        # skip_publish_logging provided in kwargs to suppress logging if further processing is to be done
+        if not kwargs.get("skip_publish_logging", False):
+            logger.info("Published")
 
     def _unpublish_item(self, item_name, item_type):
         """
@@ -381,6 +456,8 @@ class FabricWorkspace:
 
         # Delete the item from the workspace
         # https://learn.microsoft.com/en-us/rest/api/fabric/core/items/delete-item
-        self.endpoint.invoke(method="DELETE", url=f"{self.base_api_url}/items/{item_guid}")
-
-        logger.info("Unpublished")
+        try:
+            self.endpoint.invoke(method="DELETE", url=f"{self.base_api_url}/items/{item_guid}")
+            logger.info("Unpublished")
+        except Exception as e:
+            logger.warning(f"Failed to unpublish {item_type} '{item_name}'.  Raw exception: {e}")

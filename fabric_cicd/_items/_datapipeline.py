@@ -1,7 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
 import json
 import logging
+import re
 from collections import defaultdict, deque
 from pathlib import Path
+
+import dpath
 
 from fabric_cicd._common._exceptions import ParsingError
 
@@ -105,7 +111,7 @@ def sort_datapipelines(fabric_workspace_obj, unsorted_pipeline_dict, lookup_type
 
 def _find_referenced_datapipelines(fabric_workspace_obj, item_content_dict, lookup_type):
     """
-    Scan through item path and find pipeline references (including nested pipeline activities).
+    Scan through item dictionary and find pipeline references (including nested pipelines).
 
     :param item_content_dict: Dict representation of the pipeline-content file.
     :param lookup_type: Finding references in deployed file or repo file (Deployed or Repository).
@@ -113,43 +119,20 @@ def _find_referenced_datapipelines(fabric_workspace_obj, item_content_dict, look
     """
     item_type = "DataPipeline"
     reference_list = []
+    guid_pattern = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
 
-    def find_execute_pipeline_activities(input_object):
-        """
-        Recursively scans through JSON to find all pipeline references.
-
-        :param input_object: Object can be a dict or list present in the input JSON.
-        """
-        # Check if the current object is a dict
-        if isinstance(input_object, dict):
-            for key, value in input_object.items():
-                referenced_id = None
-
-                # Check for legacy and new pipeline activities
-                if key == "type" and value == "ExecutePipeline":
-                    referenced_id = input_object["typeProperties"]["pipeline"]["referenceName"]
-                elif key == "type" and value == "InvokePipeline":
-                    referenced_id = input_object["typeProperties"]["pipelineId"]
-
-                # Add found pipeline reference to list
-                if referenced_id is not None:
-                    referenced_name = fabric_workspace_obj._convert_id_to_name(
-                        item_type=item_type, generic_id=referenced_id, lookup_type=lookup_type
-                    )
-                    if referenced_name:
-                        reference_list.append(referenced_name)
-
-                # Recursively search in the value
-                else:
-                    find_execute_pipeline_activities(value)
-
-        # Check if the current object is a list
-        elif isinstance(input_object, list):
-            # Recursively search in each item
-            for item in input_object:
-                find_execute_pipeline_activities(item)
-
-    # Start the recursive search from the root of the JSON data
-    find_execute_pipeline_activities(item_content_dict)
+    # Use the dpath library to search through the dictionary for all values that match the GUID pattern
+    for _, value in dpath.search(item_content_dict, "**", yielded=True):
+        if isinstance(value, str):
+            match = guid_pattern.search(value)
+            if match:
+                # If a valid GUID is found, convert it to name. If name is not None, it's a pipeline and will be added to the reference list
+                referenced_id = match.group(0)
+                referenced_name = fabric_workspace_obj._convert_id_to_name(
+                    item_type=item_type, generic_id=referenced_id, lookup_type=lookup_type
+                )
+                # Add pipeline to the reference list if it's not already present
+                if referenced_name and referenced_name not in reference_list:
+                    reference_list.append(referenced_name)
 
     return reference_list

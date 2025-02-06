@@ -1,3 +1,7 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+
 class BaseCustomError(Exception):
     def __init__(self, message, logger, additional_info=None):
         super().__init__(message)
@@ -18,4 +22,8 @@ class TokenError(BaseCustomError):
 
 
 class InvokeError(BaseCustomError):
+    pass
+
+
+class ItemDependencyError(BaseCustomError):
     pass
